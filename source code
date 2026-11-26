@@ -1,0 +1,220 @@
+/*
+  SATELLITE SUPPORTER AND GUARD  (simple voltage logic)
+  Arduino Mega
+
+  Solar -> INA219 -> Relay NC
+  4xAA Battery -> Relay NO
+  Relay COM -> 220 Ohm -> Red LED -> GND
+  Add 1000 uF capacitor across LED+resistor (COM to GND) for gap-free power.
+
+  SERIAL: DATA,mode,status,busV,mA,mW,tempC,humidity,lightOK   9600 baud
+*/
+
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+#include <Servo.h>
+#include <DHT.h>
+#include <LiquidCrystal.h>
+
+#define SERVO_PIN   9
+#define LDR_DO_PIN  2
+#define RELAY_PIN   30
+#define DHT_PIN     4
+#define BUZZER_PIN  8
+
+LiquidCrystal lcd(22, 23, 24, 25, 26, 27);
+
+#define RELAY_ON  LOW    // COM -> NO (battery)
+#define RELAY_OFF HIGH   // COM -> NC (solar)
+#define LIGHT_OK_LEVEL LOW
+
+// ---------- SETTINGS (tune these) ----------
+const float SOLAR_ON_V  = 5.0;   // unloaded panel voltage needed to switch to solar
+const float SOLAR_OFF_V = 3.0;   // loaded voltage below this = solar failing
+const unsigned long LOW_HOLD_MS     = 3000;    // must stay low this long to fail over
+const unsigned long HOLDOFF_MS      = 10000;   // wait after failover before retrying
+const unsigned long FAULT_HOLD_MS   = 120000;  // wait after 3 failures (still retries)
+const int MAX_FAILS = 3;
+
+Adafruit_INA219 ina219;
+Servo wiper;
+DHT dht(DHT_PIN, DHT11);
+
+enum Mode { SOLAR, BACKUP };
+Mode mode = BACKUP;
+
+int failures = 0;
+unsigned long lowSince = 0, holdUntil = 0, solarStart = 0, lastTick = 0;
+bool lowActive = false;
+bool cleanedOnce = false;   // already cleaned for this issue
+bool needClean = false;     // solar just failed under load
+
+float busV = 0, curmA = 0, powerMW = 0, tempC = 0, hum = 0;
+
+const char* statusMsg = "Backup running";
+unsigned long statusUntil = 0;
+
+bool fault() { return failures >= MAX_FAILS; }
+bool lightIsNormal() { return digitalRead(LDR_DO_PIN) == LIGHT_OK_LEVEL; }
+
+void setStatus(const char* m, unsigned long d) { statusMsg = m; statusUntil = millis() + d; }
+
+const char* currentStatus() {
+  if (millis() < statusUntil) return statusMsg;
+  if (mode == SOLAR)          return "Solar running";
+  if (fault())                return "SOLAR FAULT";
+  if (!lightIsNormal())       return "LOW LIGHT";
+  return "Running on backup";
+}
+
+void beep(int n) {
+  for (int i = 0; i < n; i++) {
+    digitalWrite(BUZZER_PIN, HIGH); delay(150);
+    digitalWrite(BUZZER_PIN, LOW);  delay(150);
+  }
+}
+
+void lcdLine(int row, const char* m) {
+  lcd.setCursor(0, row);
+  int n = 0;
+  while (m[n] && n < 16) { lcd.print(m[n]); n++; }
+  while (n < 16) { lcd.print(' '); n++; }
+}
+
+void readSensors() {
+  busV = ina219.getBusVoltage_V();
+  curmA = fabs(ina219.getCurrent_mA());
+  powerMW = busV * curmA;
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t)) tempC = t;
+  if (!isnan(h)) hum = h;
+}
+
+void sendData() {
+  Serial.print("DATA,");
+  Serial.print(mode == SOLAR ? "SOLAR" : "BACKUP"); Serial.print(',');
+  Serial.print(currentStatus());                    Serial.print(',');
+  Serial.print(busV, 2);                            Serial.print(',');
+  Serial.print(curmA, 1);                           Serial.print(',');
+  Serial.print(powerMW, 1);                         Serial.print(',');
+  Serial.print(tempC, 1);                           Serial.print(',');
+  Serial.print(hum, 0);                             Serial.print(',');
+  Serial.println(lightIsNormal() ? 1 : 0);
+}
+
+void updateDisplay() {
+  readSensors();
+  char line2[17], v[8], c[8];
+  dtostrf(busV, 4, 2, v);
+  dtostrf(curmA, 4, 1, c);
+  snprintf(line2, sizeof(line2), "%sV %smA", v, c);
+
+  if (millis() < statusUntil) {
+    lcdLine(0, statusMsg);
+    lcdLine(1, line2);
+  } else if (mode == BACKUP && fault()) {
+    lcdLine(0, "SOLAR FAULT"); lcdLine(1, "Using BACKUP");
+  } else if (mode == BACKUP && !lightIsNormal()) {
+    lcdLine(0, "LOW LIGHT");   lcdLine(1, "Using BACKUP");
+  } else {
+    lcdLine(0, mode == SOLAR ? "Mode: SOLAR" : "Mode: BACKUP");
+    lcdLine(1, line2);
+  }
+  sendData();
+}
+
+void cleanPanel() {
+  setStatus("Cleaning panel", 8000);
+  lcdLine(0, "Cleaning panel"); lcdLine(1, "Backup is ON");
+  sendData();
+  wiper.attach(SERVO_PIN);
+  for (int r = 0; r < 2; r++) {
+    for (int a = 0; a <= 150; a += 3) { wiper.write(a); delay(20); }
+    for (int a = 150; a >= 0; a -= 3) { wiper.write(a); delay(20); }
+  }
+  wiper.detach();
+}
+
+void goSolar() {
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+  mode = SOLAR;
+  solarStart = millis();
+  lowActive = false;
+  setStatus("Solar active", 5000);
+  beep(1);
+}
+
+void goBackup() {
+  digitalWrite(RELAY_PIN, RELAY_ON);
+  mode = BACKUP;
+  if (failures < MAX_FAILS) failures++;
+  lowActive = false;
+  needClean = true;
+  holdUntil = millis() + (fault() ? FAULT_HOLD_MS : HOLDOFF_MS);
+  setStatus(fault() ? "SOLAR FAULT" : "Solar failed", 8000);
+  sendData();
+  beep(fault() ? 5 : 3);
+}
+
+// Runs once per second, after readSensors().
+void control() {
+  if (mode == SOLAR) {
+    if (busV < SOLAR_OFF_V) {
+      if (!lowActive) { lowActive = true; lowSince = millis(); }
+      else if (millis() - lowSince >= LOW_HOLD_MS) goBackup();
+    } else {
+      lowActive = false;
+      if (millis() - solarStart > 10000) failures = 0;   // stable solar clears fault
+    }
+  }
+  else if (millis() >= holdUntil) {
+    if (!lightIsNormal()) { cleanedOnce = false; needClean = false; return; }   // dark is not an issue
+
+    if (busV >= SOLAR_ON_V && !needClean) {
+      cleanedOnce = false;
+      goSolar();
+    } else if (needClean || (busV < SOLAR_ON_V && !cleanedOnce)) {
+      cleanPanel();                  // issue: weak panel in good light, or solar failed
+      needClean = false;
+      cleanedOnce = true;            // do not clean again until the issue changes
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  digitalWrite(RELAY_PIN, RELAY_ON);   // start on battery, no glitch
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(LDR_DO_PIN, INPUT);
+
+  lcd.begin(16, 2);
+  dht.begin();
+
+  if (!ina219.begin()) {
+    lcdLine(0, "INA219 not found"); lcdLine(1, "Check SDA/SCL");
+    while (1) delay(10);
+  }
+  ina219.setCalibration_16V_400mA();
+
+  wiper.attach(SERVO_PIN);
+  wiper.write(0);
+  delay(500);
+  wiper.detach();
+
+  lcdLine(0, "Satellite Guard"); lcdLine(1, "BACKUP MODE");
+  setStatus("Backup running", 3000);
+  delay(1500);
+  readSensors();
+  sendData();
+}
+
+void loop() {
+  if (millis() - lastTick >= 1000) {
+    lastTick = millis();
+    updateDisplay();
+    control();
+  }
+}
